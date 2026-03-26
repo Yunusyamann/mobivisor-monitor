@@ -1,11 +1,9 @@
-import json
 import os
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 import requests
 
 URL = "https://www.mobivisor.de/en/"
-STATE_FILE = "state.json"
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 MAIL_FROM = os.getenv("MAIL_FROM")
@@ -27,65 +25,63 @@ def send_email(subject, html):
             "subject": subject,
             "html": html,
         },
+        timeout=30,
     )
-
-def text_exists(page, text):
-    try:
-        page.get_by_text(text).first.wait_for(timeout=2000)
-        return True
-    except:
-        return False
 
 def accept_cookies(page):
     buttons = page.locator("button")
     for i in range(buttons.count()):
         try:
             btn = buttons.nth(i)
-            if "Accept" in btn.inner_text():
-                btn.click()
-                page.wait_for_timeout(1500)
-                return
-        except:
+            text = btn.inner_text()
+            if "Accept" in text or "accept" in text:
+                if btn.is_visible():
+                    btn.click()
+                    page.wait_for_timeout(1500)
+                    return True
+        except Exception:
             pass
-
-def evaluate(page):
-    if text_exists(page, "spam"):
-        return "spam"
-    if text_exists(page, "error"):
-        return "error"
-    if text_exists(page, "Thank"):
-        return "success"
-    return "unknown"
+    return False
 
 def run():
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
 
-        page.goto(URL)
-        page.wait_for_timeout(3000)
+        try:
+            page.goto(URL, timeout=60000)
+            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_timeout(3000)
 
-        page.mouse.wheel(0, 2500)
-        accept_cookies(page)
+            page.mouse.wheel(0, 2500)
+            accept_cookies(page)
+            page.wait_for_timeout(1000)
 
-        name = page.locator('input[type="text"]').first
-        email = page.locator('input[type="email"]').first
-        msg = page.locator('textarea').first
-        btn = page.get_by_role("button", name="Send").first
+            name_input = page.locator('input[type="text"]').first
+            email_input = page.locator('input[type="email"]').first
+            msg_input = page.locator('textarea').first
+            send_button = page.get_by_role("button", name="Send").first
 
-        name.fill("Monitor Bot")
-        email.fill("test@example.com")
-        msg.fill("Automated test")
+            if not name_input.is_visible():
+                return "form_missing"
+            if not email_input.is_visible():
+                return "form_missing"
+            if not msg_input.is_visible():
+                return "form_missing"
+            if not send_button.is_visible():
+                return "form_missing"
 
-        # 🔥 3 defa bas
-        for _ in range(3):
-            btn.click()
-            page.wait_for_timeout(2000)
+            name_input.fill("Monitor Bot")
+            email_input.fill("test@example.com")
+            msg_input.fill("Form health check")
 
-        result = evaluate(page)
+            return "healthy"
 
-        browser.close()
-        return result
+        except Exception as e:
+            return f"down: {type(e).__name__}: {e}"
+
+        finally:
+            browser.close()
 
 def main():
     result = run()
