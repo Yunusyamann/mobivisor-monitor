@@ -3,6 +3,8 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 import requests
 
+print("DEBUG: YENI HEALTH-CHECK SURUMU CALISIYOR", flush=True)
+
 URL = "https://www.mobivisor.de/en/"
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
@@ -85,12 +87,14 @@ def run():
 
 def main():
     result = run()
+    print("DEBUG RESULT:", result, flush=True)
     log(result)
 
-    send_email(
-        subject=f"Monitor sonucu: {result}",
-        html=f"<b>Durum:</b> {result}<br>{datetime.now()}"
-    )
+    if result != "healthy":
+        send_email(
+            subject=f"Monitor sonucu: {result}",
+            html=f"<b>Durum:</b> {result}<br>{datetime.now()}"
+        )
 
 if __name__ == "__main__":
     main()
