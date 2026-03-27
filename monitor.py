@@ -6,7 +6,6 @@ import requests
 
 URL = "https://www.mobivisor.de/en/"
 
-# Ortam değişkenleri (GitHub Secrets'tan gelecek)
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 MAIL_FROM = os.getenv("MAIL_FROM")
 MAIL_TO = os.getenv("MAIL_TO")
@@ -44,12 +43,14 @@ def accept_cookies_if_present(page):
     for i in range(buttons.count()):
         try:
             btn = buttons.nth(i)
-            text = btn.inner_text()
+            text = btn.inner_text().strip()
+            
             if "Accept" in text or "accept" in text:
                 if btn.is_visible():
                     btn.click()
-                    page.wait_for_timeout(1500)
-                    log("Cookie kabul edildi.")
+                    log("Cookie 'Accept' butonuna basıldı. Sitenin algılaması bekleniyor...")
+                    # Çerezin tarayıcıya işlenmesi için yeterli bekleme süresi
+                    page.wait_for_timeout(2500) 
                     return True
         except Exception:
             pass
@@ -61,19 +62,12 @@ def html5_email_valid(page):
     email_input = page.locator('input[type="email"]').first
     return email_input.evaluate("(el) => el.checkValidity()")
 
-# --- YENİ EKLENEN FONKSİYON: Gerçek Mesajı Yakalar ---
 def get_actual_response_message(page) -> str:
     try:
-        # Form mesajlarının çıktığı genel div class'ı (CF7)
+        # CF7'nin asıl mesaj kutusu
         response_locator = page.locator('.wpcf7-response-output')
-        
         if response_locator.count() > 0 and response_locator.first.is_visible():
             return response_locator.first.inner_text().strip()
-        
-        # Eğer yukarıdaki class yoksa, sayfadaki 'alert' veya bildirim rolü taşıyan bir şey arayalım
-        alert_locator = page.locator('[role="alert"]')
-        if alert_locator.count() > 0 and alert_locator.first.is_visible():
-            return alert_locator.first.inner_text().strip()
             
     except Exception as e:
         log(f"Mesaj okunurken hata: {e}")
@@ -86,9 +80,9 @@ def build_email_html(result: dict) -> str:
     return f"""
     <html>
       <body>
-        <h2>MobiVisor Submit Monitor Sonucu (Gerçek Mesaj Yakalama)</h2>
+        <h2>MobiVisor Submit Monitor Sonucu</h2>
         <p><b>Zaman:</b> {result["timestamp"]}</p>
-        <p><b>Son Mesaj (Durum):</b> {result["status"]}</p>
+        <p><b>Son Durum:</b> {result["status"]}</p>
 
         <h3>Kontroller</h3>
         <ul>
@@ -96,7 +90,7 @@ def build_email_html(result: dict) -> str:
           <li><b>Email valid:</b> {result["email_valid"]}</li>
         </ul>
 
-        <h3>Detaylar (Her Denemede Ekranda Yazan Metin)</h3>
+        <h3>Detaylar (Her Deneme Sonucu)</h3>
         <ul>
           {details_html}
         </ul>
@@ -114,21 +108,24 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
     }
 
     with sync_playwright() as p:
+        # xvfb kullandığımız için headless=False
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
 
         try:
             log("Site açılıyor...")
-            page.goto(URL)
+            page.goto(URL, timeout=60000)
             page.wait_for_load_state("domcontentloaded")
             page.wait_for_timeout(2000)
 
             page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(1000)
 
-            # COOKIE
+            # COOKIE ONAYI
             result["cookie_accepted"] = accept_cookies_if_present(page)
 
             page.mouse.wheel(0, 1500)
+            page.wait_for_timeout(1000)
 
             # FORM ELEMANLARI
             name_input = page.locator('input[type="text"]').first
@@ -147,42 +144,48 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             message_input.fill(message_value)
 
             result["email_valid"] = html5_email_valid(page)
-            log(f"Email validity: {result['email_valid']}")
-
             if not result["email_valid"]:
                 result["status"] = "invalid_email"
-                result["details"].append("❌ Email geçersiz, test durduruldu.")
+                result["details"].append("❌ Email geçersiz.")
                 return result
 
             log("Form gönderme döngüsü başlıyor...")
 
             final_message = "Hiçbir mesaj alınamadı."
-            max_attempts = 10
+            max_attempts = 5 # 5 deneme fazlasıyla yeterli olacaktır
 
             for i in range(max_attempts):
-                log(f"{i+1}. tıklama yapılıyor...")
+                log(f"{i+1}. kez butona basılıyor...")
                 
-                submit_button.click()
-                page.wait_for_timeout(1000)  # 1 saniye bekle
+                # Tıklamayı garantiye al
+                submit_button.click(force=True)
+                
+                # ÖNEMLİ: Formun sunucuya gidip yanıt dönmesi (AJAX) için tam 4 saniye bekle.
+                # Önceki kodlarda bu süre çok kısa olduğu için form kilitli kalıyordu.
+                page.wait_for_timeout(4000) 
 
-                # Sitenin arayüzündeki asıl mesajı okuyoruz
                 actual_message = get_actual_response_message(page)
                 log(f"Sitede Yazan Mesaj: {actual_message}")
                 
                 result["details"].append(f"<b>Deneme {i+1}:</b> {actual_message}")
 
-                # Mesaj başarılı içeriyorsa döngüyü kır
+                # İkinci görseldeki BAŞARI MESAJI kontrolü
                 if "Thank you" in actual_message or "successfully" in actual_message or "has been sent" in actual_message:
-                    final_message = actual_message
-                    log("✅ Başarı mesajı yakalandı, durduruluyor.")
+                    final_message = "SUCCESS: " + actual_message
+                    log("✅ Form başarıyla gönderildi!")
                     break
-
-                final_message = actual_message
+                
+                # Eğer spam hatasıysa (Birinci görsel), formun sıfırlanması için 1 saniye daha bekle ve tekrarla
+                elif "spam" in actual_message or "cookie" in actual_message:
+                    log("Spam/Cookie hatası alındı (Beklenen durum). Formun resetlenmesi bekleniyor...")
+                    page.wait_for_timeout(1500)
+                    final_message = "ERROR: " + actual_message
+                else:
+                    final_message = "UNKNOWN: " + actual_message
 
             # SONUÇ
             result["status"] = final_message
-            result["details"].append(f"<br><b>Submit son durum:</b> {final_message}")
-
+            
             return result
 
         except Exception as e:
@@ -195,7 +198,7 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             browser.close()
 
 def main():
-    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (Gerçek Mesaj Okuma)")
+    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (AJAX Beklemeli Tam Çözüm)")
 
     result = run_test(
         name_value="Test User",
@@ -205,8 +208,7 @@ def main():
 
     log(f"DEBUG RESULT: {result['status']}")
 
-    # E-posta başlığında durum çok uzun olmasın diye ilk 30 karakteri alıyoruz
-    short_status = (result['status'][:30] + '...') if len(result['status']) > 30 else result['status']
+    short_status = (result['status'][:40] + '...') if len(result['status']) > 40 else result['status']
     subject = f"MobiVisor Submit: {short_status}"
     
     html = build_email_html(result)
