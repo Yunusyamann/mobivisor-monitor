@@ -156,15 +156,8 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
 
             # COOKIE
             result["cookie_accepted"] = accept_cookies_if_present(page)
-            
-            # Eğer cookie onaylandıysa, WordPress eklentilerinin (Contact Form vs) engeli 
-            # düzgünce kaldırması için sayfayı bir kez yeniliyoruz.
-            if result["cookie_accepted"]:
-                log("Cookie kabul edildi. Form engelinin kalkması için sayfa yenileniyor...")
-                page.reload(wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
 
-            # Yenilemeden sonra formu bulabilmek için sayfayı aşağı kaydır
+            # Formu bulabilmek için sayfayı aşağı kaydır
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(1000)
 
@@ -219,10 +212,11 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
 
                 submit_result = evaluate_result(page)
                 
-                if submit_result == "spam_error":
+                # Hem spam hem de cookie hatalarında tekrar deneme mantığı
+                if submit_result in ["spam_error", "cookie_error"]:
                     if attempt < max_attempts - 1:
-                        log("Spam hatası alındı. 2 saniye beklenip tekrar denenecek...")
-                        result["details"].append(f"Deneme {attempt + 1}: Spam filtresine takıldı, tekrar deneniyor.")
+                        log(f"{submit_result} alındı. 2 saniye beklenip tekrar butona basılacak...")
+                        result["details"].append(f"Deneme {attempt + 1}: {submit_result} alındı, tekrar deneniyor.")
                         page.wait_for_timeout(2000)
                         continue
                     else:
@@ -236,12 +230,10 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
 
             if submit_result == "success":
                 result["details"].append("Form başarıyla gönderildi.")
-            elif submit_result == "spam_error":
-                result["details"].append(f"Form gönderilemedi: {max_attempts} deneme sonucunda spam filtresi aşılamadı.")
+            elif submit_result in ["spam_error", "cookie_error"]:
+                result["details"].append(f"Form gönderilemedi: {max_attempts} deneme sonucunda {submit_result} aşılamadı.")
             elif submit_result == "general_error":
                 result["details"].append("Form gönderilemedi: genel hata alındı.")
-            elif submit_result == "cookie_error":
-                result["details"].append("Form gönderilemedi: cookie onayı yetersiz (Yeniden yüklemeye rağmen).")
             elif submit_result == "unknown":
                 result["details"].append("Submit yapıldı ancak sonuç net belirlenemedi.")
 
