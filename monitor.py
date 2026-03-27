@@ -9,6 +9,9 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 MAIL_FROM = os.getenv("MAIL_FROM")
 MAIL_TO = os.getenv("MAIL_TO")
 
+# "true" ise form submit edilir, değilse sadece health-check yapılır
+SUBMIT_FORM = os.getenv("SUBMIT_FORM", "false").lower() == "true"
+
 
 def log(msg: str):
     print(msg, flush=True)
@@ -33,6 +36,14 @@ def send_email(subject: str, html: str):
     log(f"MAIL STATUS CODE: {response.status_code}")
     if response.status_code >= 300:
         log(f"MAIL RESPONSE: {response.text}")
+
+
+def text_exists(page, text: str, timeout=4000) -> bool:
+    try:
+        page.get_by_text(text, exact=False).first.wait_for(state="visible", timeout=timeout)
+        return True
+    except Exception:
+        return False
 
 
 def accept_cookies(page) -> bool:
@@ -77,6 +88,31 @@ def html5_email_valid(page) -> bool:
         return False
 
 
+def detect_submit_result(page) -> str:
+    # Önce belirgin hata durumları
+    if text_exists(page, "Please enter an email address."):
+        return "invalid_email"
+
+    if text_exists(page, "You need to accept cookies before send form message."):
+        return "cookie_error"
+
+    if text_exists(page, "Submission was referred to as spam"):
+        return "spam_error"
+
+    if text_exists(page, "There was an error sending your message"):
+        return "general_error"
+
+    # Başarı durumları
+    if (
+        text_exists(page, "Thank you")
+        or text_exists(page, "Your message has been sent")
+        or text_exists(page, "successfully")
+    ):
+        return "success"
+
+    return "unknown_after_submit"
+
+
 def run():
     result = {
         "status": "unknown",
@@ -90,6 +126,8 @@ def run():
         "fill_email_ok": False,
         "fill_message_ok": False,
         "email_valid": False,
+        "submit_performed": False,
+        "submit_result": "not_attempted",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -128,49 +166,85 @@ def run():
             if not result["send_visible"]:
                 result["details"].append("Send butonu görünmüyor.")
 
-            if (
+            if not (
                 result["name_visible"]
                 and result["email_visible"]
                 and result["message_visible"]
                 and result["send_visible"]
             ):
-                result["fill_name_ok"] = safe_fill(name_input, "Monitor Bot")
-                result["fill_email_ok"] = safe_fill(email_input, "test@example.com")
-                result["fill_message_ok"] = safe_fill(message_input, "Form health check")
-
-                if not result["fill_name_ok"]:
-                    result["details"].append("Name alanına yazılamadı.")
-                if not result["fill_email_ok"]:
-                    result["details"].append("Email alanına yazılamadı.")
-                if not result["fill_message_ok"]:
-                    result["details"].append("Message alanına yazılamadı.")
-
-                result["email_valid"] = html5_email_valid(page)
-
-                if not result["email_valid"]:
-                    result["details"].append("Email HTML5 validation'dan geçmedi.")
-
-                if (
-                    result["fill_name_ok"]
-                    and result["fill_email_ok"]
-                    and result["fill_message_ok"]
-                    and result["email_valid"]
-                ):
-                    result["status"] = "healthy"
-                    result["details"].append("Form alanları bulundu ve başarıyla dolduruldu.")
-                else:
-                    result["status"] = "form_fill_problem"
-            else:
                 result["status"] = "form_missing"
+                return result
+
+            result["fill_name_ok"] = safe_fill(name_input, "Monitor Bot")
+            result["fill_email_ok"] = safe_fill(email_input, "test@example.com")
+            result["fill_message_ok"] = safe_fill(
+                message_input,
+                f"Form health check - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+            if not result["fill_name_ok"]:
+                result["details"].append("Name alanına yazılamadı.")
+            if not result["fill_email_ok"]:
+                result["details"].append("Email alanına yazılamadı.")
+            if not result["fill_message_ok"]:
+                result["details"].append("Message alanına yazılamadı.")
+
+            result["email_valid"] = html5_email_valid(page)
+            if not result["email_valid"]:
+                result["details"].append("Email HTML5 validation'dan geçmedi.")
+
+            if not (
+                result["fill_name_ok"]
+                and result["fill_email_ok"]
+                and result["fill_message_ok"]
+                and result["email_valid"]
+            ):
+                result["status"] = "form_fill_problem"
+                return result
+
+            # Buraya kadar health-check başarılı
+            result["status"] = "healthy"
+            result["details"].append("Form alanları bulundu ve başarıyla dolduruldu.")
+
+            # İstenirse gerçek submit yapılır
+            if SUBMIT_FORM:
+                result["submit_performed"] = True
+                result["details"].append("Submit testi başlatıldı.")
+
+                send_button.click()
+                page.wait_for_timeout(6000)
+
+                submit_result = detect_submit_result(page)
+                result["submit_result"] = submit_result
+
+                if submit_result == "success":
+                    result["details"].append("Form başarıyla gönderildi.")
+                    result["status"] = "submit_success"
+                elif submit_result == "invalid_email":
+                    result["details"].append("Form gönderilemedi: email geçersiz.")
+                    result["status"] = "submit_failed"
+                elif submit_result == "cookie_error":
+                    result["details"].append("Form gönderilemedi: cookie hatası.")
+                    result["status"] = "submit_failed"
+                elif submit_result == "spam_error":
+                    result["details"].append("Form gönderilemedi: spam filtresine takıldı.")
+                    result["status"] = "submit_failed"
+                elif submit_result == "general_error":
+                    result["details"].append("Form gönderilemedi: genel hata mesajı döndü.")
+                    result["status"] = "submit_failed"
+                else:
+                    result["details"].append("Form submit edildi ancak sonuç net tespit edilemedi.")
+                    result["status"] = "submit_unknown"
+
+            return result
 
         except Exception as e:
             result["status"] = "down"
             result["details"].append(f"{type(e).__name__}: {e}")
+            return result
 
         finally:
             browser.close()
-
-    return result
 
 
 def build_email_html(result: dict) -> str:
@@ -182,6 +256,8 @@ def build_email_html(result: dict) -> str:
         <h2>MobiVisor Form Monitor Sonucu</h2>
         <p><b>Zaman:</b> {result["timestamp"]}</p>
         <p><b>Durum:</b> {result["status"]}</p>
+        <p><b>Submit yapıldı mı:</b> {result["submit_performed"]}</p>
+        <p><b>Submit sonucu:</b> {result["submit_result"]}</p>
 
         <h3>Kontroller</h3>
         <ul>
@@ -206,7 +282,8 @@ def build_email_html(result: dict) -> str:
 
 
 def main():
-    log("DEBUG: YENI HEALTH-CHECK SURUMU CALISIYOR")
+    log("DEBUG: YENI MONITOR SURUMU CALISIYOR")
+    log(f"DEBUG: SUBMIT_FORM={SUBMIT_FORM}")
 
     result = run()
 
