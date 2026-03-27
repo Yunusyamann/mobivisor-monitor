@@ -43,72 +43,38 @@ def text_exists(page, text: str, timeout=2000) -> bool:
         return False
 
 
-def accept_cookies_if_present(page) -> bool:
-    log("Cookie popup kontrol ediliyor...")
-
-    # 1. YÖNTEM: Popüler eklentilerin spesifik "Tümünü Kabul Et" buton ID/Class'ları
-    known_selectors = [
-        "#borlabs-cookie-btn-accept-all",      # Borlabs
-        ".borlabs-cookie-btn-accept-all",
-        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", # Cookiebot
-        ".cm-btn-accept-all",                  # Complianz
-        "#cookie_action_close_header",         # Cookie Law Info
-        "button[data-cookiefirst-action='accept']",
-        ".cookie-btn-accept",
-        "a.cc-allow"
-    ]
-
-    for selector in known_selectors:
-        try:
-            btn = page.locator(selector).first
-            if btn.is_visible(timeout=1000):
-                # JS ile tıklayarak engelleri bypass et
-                btn.evaluate("node => node.click()")
-                page.wait_for_timeout(3000)
-                log(f"Cookie CSS seçicisi ({selector}) ile kesin olarak kabul edildi.")
-                return True
-        except Exception:
-            pass
-
-    # 2. YÖNTEM: Kesin metin eşleşmesi
-    primary_texts = ["Accept All", "Allow all", "Alle akzeptieren", "Tümünü Kabul Et"]
-    for text in primary_texts:
-        try:
-            btn = page.get_by_text(text, exact=True).first
-            if btn.is_visible(timeout=1000):
-                btn.evaluate("node => node.click()")
-                page.wait_for_timeout(3000)
-                log(f"Cookie '{text}' metni ile kabul edildi.")
-                return True
-        except Exception:
-            pass
-
-    # 3. YÖNTEM: Sadece "Necessary" İÇERMEYEN accept butonları
+def bypass_complianz_cookies(context, page) -> bool:
+    log("Complianz çerezleri tarayıcıya enjekte ediliyor...")
     try:
-        buttons = page.locator("button, a")
-        count = buttons.count()
-        for i in range(count):
-            try:
-                btn = buttons.nth(i)
-                btn_text = btn.inner_text().strip().lower()
-                
-                if "accept" in btn_text or "allow" in btn_text or "akzeptieren" in btn_text:
-                    # Gerekli çerez butonlarını KESİNLİKLE atla
-                    if "necessary" in btn_text or "essential" in btn_text or "nur" in btn_text:
-                        continue
-                        
-                    if btn.is_visible():
-                        btn.evaluate("node => node.click()")
-                        page.wait_for_timeout(3000)
-                        log(f"Cookie akıllı genel aramayla ({btn_text}) kabul edildi.")
-                        return True
-            except Exception:
-                continue
-    except Exception:
-        pass
+        # 1. Aşama: Doğrudan Cookie'lere Complianz onaylarını ekle
+        cookies = [
+            {"name": "cmplz_consent_status", "value": "allow", "domain": ".mobivisor.de", "path": "/"},
+            {"name": "cmplz_marketing", "value": "allow", "domain": ".mobivisor.de", "path": "/"},
+            {"name": "cmplz_statistics", "value": "allow", "domain": ".mobivisor.de", "path": "/"},
+            {"name": "cmplz_preferences", "value": "allow", "domain": ".mobivisor.de", "path": "/"},
+            {"name": "cmplz_functional", "value": "allow", "domain": ".mobivisor.de", "path": "/"},
+            {"name": "cmplz_banner-status", "value": "dismissed", "domain": ".mobivisor.de", "path": "/"}
+        ]
+        context.add_cookies(cookies)
 
-    log("Cookie popup bulunamadı veya işlem yapılamadı.")
-    return False
+        # 2. Aşama: Sayfa yüklendikten sonra Local Storage'a da onayları ekle (Complianz bazen burayı da kontrol eder)
+        page.evaluate("""
+            localStorage.setItem('cmplz_consent_status', 'allow');
+            localStorage.setItem('cmplz_marketing', 'allow');
+            localStorage.setItem('cmplz_statistics', 'allow');
+            localStorage.setItem('cmplz_preferences', 'allow');
+            localStorage.setItem('cmplz_functional', 'allow');
+            localStorage.setItem('cmplz_banner-status', 'dismissed');
+        """)
+        
+        log("Çerezler başarıyla enjekte edildi. Sayfa yenileniyor...")
+        # Çerezlerin site altyapısında aktif olması için sayfayı bir kez yenilememiz şart
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+        return True
+    except Exception as e:
+        log(f"Çerez enjekte edilirken hata oluştu: {e}")
+        return False
 
 
 def html5_email_valid(page) -> bool:
@@ -192,20 +158,13 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
         try:
             log("Site açılıyor...")
             page.goto(URL, timeout=60000)
-            page.wait_for_load_state("networkidle") # Sitenin tam yüklenmesini bekle
-            page.wait_for_timeout(2000)
-
-            # COOKIE YÖNETİMİ
-            page.mouse.wheel(0, 2500)
-            page.wait_for_timeout(1000)
-            result["cookie_accepted"] = accept_cookies_if_present(page)
-
-            # Çerezlerin kaydedilip kaydedilmediğini görmek için log ekledik
-            cookies = context.cookies()
-            log(f"Mevcut tarayıcı çerezi sayısı: {len(cookies)}")
+            page.wait_for_load_state("domcontentloaded")
+            
+            # --- ZORLA ÇEREZ ENJEKSİYONU ---
+            result["cookie_accepted"] = bypass_complianz_cookies(context, page)
 
             # Formu bulabilmek için sayfayı aşağı kaydır
-            page.mouse.wheel(0, 1500)
+            page.mouse.wheel(0, 2000)
             page.wait_for_timeout(1000)
 
             # FORM ELEMANLARINI BUL
@@ -219,11 +178,10 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
                 result["details"].append("Eksik form elemanı.")
                 return result
 
-            log("Form dolduruluyor (Gerçek insan simülasyonu)...")
-            # fill() yerine type() kullanıyoruz ki bot algılaması düşsün
-            name_input.type(name_value, delay=50)
-            email_input.type(email_value, delay=50)
-            message_input.type(message_value, delay=50)
+            log("Form dolduruluyor...")
+            name_input.fill(name_value)
+            email_input.fill(email_value)
+            message_input.fill(message_value)
 
             result["email_valid"] = html5_email_valid(page)
             log(f"Email validity: {result['email_valid']}")
@@ -239,9 +197,8 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
 
             for i in range(3):
                 log(f"{i+1}. tıklama yapılıyor...")
-                # Zorla JS tıklaması
                 submit_button.evaluate("node => node.click()")
-                page.wait_for_timeout(2500)  # Tıklama sonrası 2.5 saniye bekle
+                page.wait_for_timeout(2000)  # Manuel koddaki gibi 2 saniye bekle
 
                 current_result = evaluate_result(page)
                 log(f"Sonuç: {current_result}")
@@ -253,9 +210,6 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
                 submit_result = current_result
                 if i < 2:
                     result["details"].append(f"Deneme {i + 1}: {current_result} alındı, tekrar deneniyor.")
-                    # Hata alındığında hafifçe kaydır ve bekle
-                    page.mouse.wheel(0, 100)
-                    page.wait_for_timeout(1000)
 
             # SONUÇLARI KAYDET
             result["status"] = submit_result
