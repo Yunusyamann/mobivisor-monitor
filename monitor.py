@@ -38,23 +38,13 @@ def send_email(subject: str, html: str):
     if response.status_code >= 300:
         log(f"MAIL RESPONSE: {response.text}")
 
-def text_exists(page, text: str, timeout=2000):
-    try:
-        page.get_by_text(text, exact=False).first.wait_for(state="visible", timeout=timeout)
-        return True
-    except Exception:
-        return False
-
 def accept_cookies_if_present(page):
     log("Cookie popup kontrol ediliyor...")
-
     buttons = page.locator("button")
-
     for i in range(buttons.count()):
         try:
             btn = buttons.nth(i)
             text = btn.inner_text()
-
             if "Accept" in text or "accept" in text:
                 if btn.is_visible():
                     btn.click()
@@ -71,27 +61,24 @@ def html5_email_valid(page):
     email_input = page.locator('input[type="email"]').first
     return email_input.evaluate("(el) => el.checkValidity()")
 
-def evaluate_result(page):
-    if text_exists(page, "Please enter an email address."):
-        return "invalid_email"
+# --- YENİ EKLENEN FONKSİYON: Gerçek Mesajı Yakalar ---
+def get_actual_response_message(page) -> str:
+    try:
+        # Form mesajlarının çıktığı genel div class'ı (CF7)
+        response_locator = page.locator('.wpcf7-response-output')
+        
+        if response_locator.count() > 0 and response_locator.first.is_visible():
+            return response_locator.first.inner_text().strip()
+        
+        # Eğer yukarıdaki class yoksa, sayfadaki 'alert' veya bildirim rolü taşıyan bir şey arayalım
+        alert_locator = page.locator('[role="alert"]')
+        if alert_locator.count() > 0 and alert_locator.first.is_visible():
+            return alert_locator.first.inner_text().strip()
+            
+    except Exception as e:
+        log(f"Mesaj okunurken hata: {e}")
 
-    if text_exists(page, "You need to accept cookies before send form message."):
-        return "cookie_error"
-
-    if text_exists(page, "Submission was referred to as spam"):
-        return "spam_error"
-
-    if text_exists(page, "There was an error sending your message"):
-        return "general_error"
-
-    if (
-        text_exists(page, "Thank you") or
-        text_exists(page, "successfully") or
-        text_exists(page, "Your message has been sent")
-    ):
-        return "success"
-
-    return "unknown"
+    return "Ekranda herhangi bir geri dönüş mesajı tespit edilemedi."
 
 def build_email_html(result: dict) -> str:
     details_html = "".join(f"<li>{item}</li>" for item in result["details"])
@@ -99,9 +86,9 @@ def build_email_html(result: dict) -> str:
     return f"""
     <html>
       <body>
-        <h2>MobiVisor Submit Monitor Sonucu</h2>
+        <h2>MobiVisor Submit Monitor Sonucu (Gerçek Mesaj Yakalama)</h2>
         <p><b>Zaman:</b> {result["timestamp"]}</p>
-        <p><b>Durum:</b> {result["status"]}</p>
+        <p><b>Son Mesaj (Durum):</b> {result["status"]}</p>
 
         <h3>Kontroller</h3>
         <ul>
@@ -109,7 +96,7 @@ def build_email_html(result: dict) -> str:
           <li><b>Email valid:</b> {result["email_valid"]}</li>
         </ul>
 
-        <h3>Detaylar</h3>
+        <h3>Detaylar (Her Denemede Ekranda Yazan Metin)</h3>
         <ul>
           {details_html}
         </ul>
@@ -127,7 +114,6 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
     }
 
     with sync_playwright() as p:
-        # ÖNEMLİ: xvfb kullanılacağı için headless=False bırakıldı
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
 
@@ -170,47 +156,32 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
 
             log("Form gönderme döngüsü başlıyor...")
 
-            final_result = "unknown"
+            final_message = "Hiçbir mesaj alınamadı."
             max_attempts = 10
 
-            # İSTEDİĞİN 10 KERELİK DÖNGÜ (1 saniye arayla)
             for i in range(max_attempts):
                 log(f"{i+1}. tıklama yapılıyor...")
                 
                 submit_button.click()
                 page.wait_for_timeout(1000)  # 1 saniye bekle
 
-                current_result = evaluate_result(page)
-                log(f"Sonuç: {current_result}")
+                # Sitenin arayüzündeki asıl mesajı okuyoruz
+                actual_message = get_actual_response_message(page)
+                log(f"Sitede Yazan Mesaj: {actual_message}")
+                
+                result["details"].append(f"<b>Deneme {i+1}:</b> {actual_message}")
 
-                # başarılıysa dur
-                if current_result == "success":
-                    final_result = current_result
+                # Mesaj başarılı içeriyorsa döngüyü kır
+                if "Thank you" in actual_message or "successfully" in actual_message or "has been sent" in actual_message:
+                    final_message = actual_message
+                    log("✅ Başarı mesajı yakalandı, durduruluyor.")
                     break
 
-                final_result = current_result
-                if i < max_attempts - 1:
-                     result["details"].append(f"Deneme {i + 1}: {current_result} alındı, tekrar deneniyor.")
+                final_message = actual_message
 
             # SONUÇ
-            result["status"] = final_result
-            result["details"].append(f"Submit son durum: {final_result}")
-
-            if final_result == "success":
-                result["details"].append("Form başarıyla gönderildi.")
-                log("✅ TEST PASS")
-            elif final_result == "spam_error":
-                result["details"].append("❌ SPAM filtresine takıldı")
-                log("❌ SPAM filtresine takıldı")
-            elif final_result == "general_error":
-                result["details"].append("❌ Genel hata alındı")
-                log("❌ Genel hata alındı")
-            elif final_result == "cookie_error":
-                 result["details"].append("❌ Cookie problemi")
-                 log("❌ Cookie problemi")
-            else:
-                result["details"].append("⚠️ Belirsiz durum")
-                log("⚠️ Belirsiz durum")
+            result["status"] = final_message
+            result["details"].append(f"<br><b>Submit son durum:</b> {final_message}")
 
             return result
 
@@ -224,7 +195,7 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             browser.close()
 
 def main():
-    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (10 Deneme, xvfb uyumlu)")
+    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (Gerçek Mesaj Okuma)")
 
     result = run_test(
         name_value="Test User",
@@ -234,7 +205,10 @@ def main():
 
     log(f"DEBUG RESULT: {result['status']}")
 
-    subject = f"MobiVisor submit sonucu: {result['status']}"
+    # E-posta başlığında durum çok uzun olmasın diye ilk 30 karakteri alıyoruz
+    short_status = (result['status'][:30] + '...') if len(result['status']) > 30 else result['status']
+    subject = f"MobiVisor Submit: {short_status}"
+    
     html = build_email_html(result)
     send_email(subject, html)
 
