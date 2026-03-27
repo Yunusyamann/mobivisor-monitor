@@ -35,7 +35,6 @@ def send_email(subject: str, html: str):
         log(f"MAIL RESPONSE: {response.text}")
 
 
-# Timeout süresi manuel kodundaki gibi 2000 yapıldı
 def text_exists(page, text: str, timeout=2000) -> bool:
     try:
         page.get_by_text(text, exact=False).first.wait_for(state="visible", timeout=timeout)
@@ -44,27 +43,53 @@ def text_exists(page, text: str, timeout=2000) -> bool:
         return False
 
 
-# Cookie fonksiyonu başarılı olan manuel kodunla birebir aynı yapıldı
 def accept_cookies_if_present(page) -> bool:
     log("Cookie popup kontrol ediliyor...")
 
-    buttons = page.locator("button")
-
-    for i in range(buttons.count()):
+    # 1. AŞAMA: Kesin olarak "Tümünü Kabul Et" anlamına gelen butonları ara
+    primary_texts = ["Accept All", "Accept all", "Allow all", "Alle akzeptieren", "Tümünü Kabul Et", "Zustimmen"]
+    
+    for text in primary_texts:
         try:
-            btn = buttons.nth(i)
-            text = btn.inner_text()
-
-            if "Accept" in text or "accept" in text:
-                if btn.is_visible():
-                    btn.click()
-                    page.wait_for_timeout(1500)
-                    log("Cookie kabul edildi.")
-                    return True
+            # Sadece buton değil, div veya link olarak da tasarlanmış olabilir
+            elements = page.get_by_text(text, exact=False)
+            if elements.count() > 0:
+                for i in range(elements.count()):
+                    el = elements.nth(i)
+                    if el.is_visible():
+                        # force=True ile elementin üzeri başka bir şeyle kaplıysa bile tıklamasını zorluyoruz
+                        el.click(force=True)
+                        page.wait_for_timeout(2500)
+                        log(f"Cookie '{text}' metni ile tam olarak kabul edildi.")
+                        return True
         except Exception:
             pass
 
-    log("Cookie popup bulunamadı.")
+    # 2. AŞAMA: Genel buton araması (Ancak "Sadece Zorunluları Kabul Et" butonlarını filtrele!)
+    buttons = page.locator("button, a, .cookie-btn")
+    try:
+        count = buttons.count()
+        for i in range(count):
+            try:
+                btn = buttons.nth(i)
+                btn_text = btn.inner_text().strip().lower()
+                
+                # İçinde accept/akzeptieren geçen ama necessary/essential GEÇMEYEN butonları bul
+                if ("accept" in btn_text or "allow" in btn_text or "akzeptieren" in btn_text):
+                    if "necessary" in btn_text or "essential" in btn_text or "nur" in btn_text:
+                        continue # Zorunlu çerez butonunu atla
+                        
+                    if btn.is_visible():
+                        btn.click(force=True)
+                        page.wait_for_timeout(2500)
+                        log(f"Cookie genel aramasıyla ({btn_text}) kabul edildi.")
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    log("Cookie popup bulunamadı veya işlem yapılamadı.")
     return False
 
 
@@ -131,16 +156,14 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
     }
 
     with sync_playwright() as p:
-        # --- Tarayıcı Ayarları Revizyonu ---
         browser = p.chromium.launch(
             headless=True,
             args=[
-                "--disable-blink-features=AutomationControlled", # Bot olduğunu gizler
+                "--disable-blink-features=AutomationControlled",
                 "--start-maximized"
             ]
         )
         
-        # Gerçek bir tarayıcı gibi görünmek için context ayarları
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080}
@@ -160,6 +183,7 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
 
             # Formu bulabilmek için sayfayı aşağı kaydır
             page.mouse.wheel(0, 1500)
+            page.wait_for_timeout(1000) # Kaydırma sonrası ufak bir bekleme
 
             # FORM ELEMANLARINI BUL
             name_input = page.locator('input[type="text"]').first
@@ -206,7 +230,7 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
 
             for i in range(3):
                 log(f"{i+1}. tıklama yapılıyor...")
-                submit_button.click()
+                submit_button.click(force=True) # Tıklamayı garanti altına alıyoruz
                 page.wait_for_timeout(2000)  # Tam 2 saniye bekle
 
                 current_result = evaluate_result(page)
