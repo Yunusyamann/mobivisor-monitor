@@ -46,43 +46,61 @@ def text_exists(page, text: str, timeout=2000) -> bool:
 def accept_cookies_if_present(page) -> bool:
     log("Cookie popup kontrol ediliyor...")
 
-    # 1. AŞAMA: Kesin olarak "Tümünü Kabul Et" anlamına gelen butonları ara
-    primary_texts = ["Accept All", "Accept all", "Allow all", "Alle akzeptieren", "Tümünü Kabul Et", "Zustimmen"]
-    
-    for text in primary_texts:
+    # 1. YÖNTEM: Popüler eklentilerin spesifik "Tümünü Kabul Et" buton ID/Class'ları
+    known_selectors = [
+        "#borlabs-cookie-btn-accept-all",      # Borlabs
+        ".borlabs-cookie-btn-accept-all",
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", # Cookiebot
+        ".cm-btn-accept-all",                  # Complianz
+        "#cookie_action_close_header",         # Cookie Law Info
+        "button[data-cookiefirst-action='accept']",
+        ".cookie-btn-accept",
+        "a.cc-allow"
+    ]
+
+    for selector in known_selectors:
         try:
-            # Sadece buton değil, div veya link olarak da tasarlanmış olabilir
-            elements = page.get_by_text(text, exact=False)
-            if elements.count() > 0:
-                for i in range(elements.count()):
-                    el = elements.nth(i)
-                    if el.is_visible():
-                        # force=True ile elementin üzeri başka bir şeyle kaplıysa bile tıklamasını zorluyoruz
-                        el.click(force=True)
-                        page.wait_for_timeout(2500)
-                        log(f"Cookie '{text}' metni ile tam olarak kabul edildi.")
-                        return True
+            btn = page.locator(selector).first
+            if btn.is_visible(timeout=1000):
+                # JS ile tıklayarak engelleri bypass et
+                btn.evaluate("node => node.click()")
+                page.wait_for_timeout(3000)
+                log(f"Cookie CSS seçicisi ({selector}) ile kesin olarak kabul edildi.")
+                return True
         except Exception:
             pass
 
-    # 2. AŞAMA: Genel buton araması (Ancak "Sadece Zorunluları Kabul Et" butonlarını filtrele!)
-    buttons = page.locator("button, a, .cookie-btn")
+    # 2. YÖNTEM: Kesin metin eşleşmesi
+    primary_texts = ["Accept All", "Allow all", "Alle akzeptieren", "Tümünü Kabul Et"]
+    for text in primary_texts:
+        try:
+            btn = page.get_by_text(text, exact=True).first
+            if btn.is_visible(timeout=1000):
+                btn.evaluate("node => node.click()")
+                page.wait_for_timeout(3000)
+                log(f"Cookie '{text}' metni ile kabul edildi.")
+                return True
+        except Exception:
+            pass
+
+    # 3. YÖNTEM: Sadece "Necessary" İÇERMEYEN accept butonları
     try:
+        buttons = page.locator("button, a")
         count = buttons.count()
         for i in range(count):
             try:
                 btn = buttons.nth(i)
                 btn_text = btn.inner_text().strip().lower()
                 
-                # İçinde accept/akzeptieren geçen ama necessary/essential GEÇMEYEN butonları bul
-                if ("accept" in btn_text or "allow" in btn_text or "akzeptieren" in btn_text):
+                if "accept" in btn_text or "allow" in btn_text or "akzeptieren" in btn_text:
+                    # Gerekli çerez butonlarını KESİNLİKLE atla
                     if "necessary" in btn_text or "essential" in btn_text or "nur" in btn_text:
-                        continue # Zorunlu çerez butonunu atla
+                        continue
                         
                     if btn.is_visible():
-                        btn.click(force=True)
-                        page.wait_for_timeout(2500)
-                        log(f"Cookie genel aramasıyla ({btn_text}) kabul edildi.")
+                        btn.evaluate("node => node.click()")
+                        page.wait_for_timeout(3000)
+                        log(f"Cookie akıllı genel aramayla ({btn_text}) kabul edildi.")
                         return True
             except Exception:
                 continue
@@ -174,16 +192,21 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
         try:
             log("Site açılıyor...")
             page.goto(URL, timeout=60000)
-            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_load_state("networkidle") # Sitenin tam yüklenmesini bekle
             page.wait_for_timeout(2000)
 
-            # COOKIE
+            # COOKIE YÖNETİMİ
             page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(1000)
             result["cookie_accepted"] = accept_cookies_if_present(page)
+
+            # Çerezlerin kaydedilip kaydedilmediğini görmek için log ekledik
+            cookies = context.cookies()
+            log(f"Mevcut tarayıcı çerezi sayısı: {len(cookies)}")
 
             # Formu bulabilmek için sayfayı aşağı kaydır
             page.mouse.wheel(0, 1500)
-            page.wait_for_timeout(1000) # Kaydırma sonrası ufak bir bekleme
+            page.wait_for_timeout(1000)
 
             # FORM ELEMANLARINI BUL
             name_input = page.locator('input[type="text"]').first
@@ -191,30 +214,16 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             message_input = page.locator('textarea').first
             submit_button = page.get_by_role("button", name="Send").first
 
-            if not name_input.is_visible():
-                result["status"] = "form_missing"
-                result["details"].append("Name alanı görünmüyor.")
-                return result
-
-            if not email_input.is_visible():
-                result["status"] = "form_missing"
-                result["details"].append("Email alanı görünmüyor.")
-                return result
-
-            if not message_input.is_visible():
-                result["status"] = "form_missing"
-                result["details"].append("Message alanı görünmüyor.")
-                return result
-
             if not submit_button.is_visible():
                 result["status"] = "form_missing"
-                result["details"].append("Send butonu görünmüyor.")
+                result["details"].append("Eksik form elemanı.")
                 return result
 
-            log("Form dolduruluyor...")
-            name_input.fill(name_value)
-            email_input.fill(email_value)
-            message_input.fill(message_value)
+            log("Form dolduruluyor (Gerçek insan simülasyonu)...")
+            # fill() yerine type() kullanıyoruz ki bot algılaması düşsün
+            name_input.type(name_value, delay=50)
+            email_input.type(email_value, delay=50)
+            message_input.type(message_value, delay=50)
 
             result["email_valid"] = html5_email_valid(page)
             log(f"Email validity: {result['email_valid']}")
@@ -230,13 +239,13 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
 
             for i in range(3):
                 log(f"{i+1}. tıklama yapılıyor...")
-                submit_button.click(force=True) # Tıklamayı garanti altına alıyoruz
-                page.wait_for_timeout(2000)  # Tam 2 saniye bekle
+                # Zorla JS tıklaması
+                submit_button.evaluate("node => node.click()")
+                page.wait_for_timeout(2500)  # Tıklama sonrası 2.5 saniye bekle
 
                 current_result = evaluate_result(page)
                 log(f"Sonuç: {current_result}")
 
-                # başarılıysa dur
                 if current_result == "success":
                     submit_result = current_result
                     break
@@ -244,6 +253,9 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
                 submit_result = current_result
                 if i < 2:
                     result["details"].append(f"Deneme {i + 1}: {current_result} alındı, tekrar deneniyor.")
+                    # Hata alındığında hafifçe kaydır ve bekle
+                    page.mouse.wheel(0, 100)
+                    page.wait_for_timeout(1000)
 
             # SONUÇLARI KAYDET
             result["status"] = submit_result
@@ -252,15 +264,9 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             if submit_result == "success":
                 result["details"].append("Form başarıyla gönderildi.")
                 log("✅ TEST PASS")
-            elif submit_result in ["spam_error", "cookie_error"]:
+            else:
                 result["details"].append(f"Form gönderilemedi: 3 deneme sonucunda {submit_result} aşılamadı.")
                 log(f"❌ {submit_result}")
-            elif submit_result == "general_error":
-                result["details"].append("Form gönderilemedi: genel hata alındı.")
-                log("❌ Genel hata alındı")
-            elif submit_result == "unknown":
-                result["details"].append("Submit yapıldı ancak sonuç net belirlenemedi.")
-                log("⚠️ Belirsiz durum")
 
             return result
 
