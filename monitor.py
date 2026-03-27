@@ -6,6 +6,7 @@ import requests
 
 URL = "https://www.mobivisor.de/en/"
 
+# Ortam değişkenleri (GitHub Secrets'tan gelecek)
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 MAIL_FROM = os.getenv("MAIL_FROM")
 MAIL_TO = os.getenv("MAIL_TO")
@@ -39,18 +40,30 @@ def send_email(subject: str, html: str):
 
 def accept_cookies_if_present(page):
     log("Cookie popup kontrol ediliyor...")
-    buttons = page.locator("button")
+    
+    # 1. Complianz eklentisinin kendi 'Tümünü Kabul Et' sınıfı
+    try:
+        btn = page.locator('.cmplz-accept').first
+        if btn.is_visible(timeout=2000):
+            btn.click(force=True)
+            log("Complianz 'Tümünü Kabul Et' (.cmplz-accept) butonuna basıldı.")
+            page.wait_for_timeout(2000)
+            return True
+    except Exception:
+        pass
+
+    # 2. İçinde 'Accept' geçen ama 'necessary' GEÇMEYEN genel arama
+    buttons = page.locator("button, .cookie-btn, a.cc-allow")
     for i in range(buttons.count()):
         try:
             btn = buttons.nth(i)
-            text = btn.inner_text().strip()
+            text = btn.inner_text().strip().lower()
             
-            if "Accept" in text or "accept" in text:
+            if ("accept" in text or "allow" in text) and "necessary" not in text:
                 if btn.is_visible():
-                    btn.click()
-                    log("Cookie 'Accept' butonuna basıldı. Sitenin algılaması bekleniyor...")
-                    # Çerezin tarayıcıya işlenmesi için yeterli bekleme süresi
-                    page.wait_for_timeout(2500) 
+                    btn.click(force=True)
+                    log(f"Genel Cookie Butonu ('{text}') basıldı.")
+                    page.wait_for_timeout(2000)
                     return True
         except Exception:
             pass
@@ -64,11 +77,9 @@ def html5_email_valid(page):
 
 def get_actual_response_message(page) -> str:
     try:
-        # CF7'nin asıl mesaj kutusu
         response_locator = page.locator('.wpcf7-response-output')
         if response_locator.count() > 0 and response_locator.first.is_visible():
             return response_locator.first.inner_text().strip()
-            
     except Exception as e:
         log(f"Mesaj okunurken hata: {e}")
 
@@ -108,9 +119,13 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
     }
 
     with sync_playwright() as p:
-        # xvfb kullandığımız için headless=False
+        # xvfb ile çalışırken bot olduğumuzu belli etmemek için gerçekçi User-Agent ekliyoruz
         browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080}
+        )
+        page = context.new_page()
 
         try:
             log("Site açılıyor...")
@@ -118,12 +133,18 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             page.wait_for_load_state("domcontentloaded")
             page.wait_for_timeout(2000)
 
-            page.mouse.wheel(0, 2500)
-            page.wait_for_timeout(1000)
-
             # COOKIE ONAYI
             result["cookie_accepted"] = accept_cookies_if_present(page)
 
+            # ---------------------------------------------------------
+            # EN KRİTİK NOKTA: Çerez onayından sonra SİTEYİ YENİLE
+            # ---------------------------------------------------------
+            if result["cookie_accepted"]:
+                log("Cookie onaylandı! Spam tokenlarının yenilenmesi için sayfa TEKRAR YÜKLENİYOR...")
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_timeout(3000) # Yenilenme sonrası bekleme
+
+            # Formu bulabilmek için kaydır
             page.mouse.wheel(0, 1500)
             page.wait_for_timeout(1000)
 
@@ -152,32 +173,28 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             log("Form gönderme döngüsü başlıyor...")
 
             final_message = "Hiçbir mesaj alınamadı."
-            max_attempts = 5 # 5 deneme fazlasıyla yeterli olacaktır
+            max_attempts = 5 # Sayfa yenilendiği için 5 deneme bile çok fazla, ilkinde geçmeli
 
             for i in range(max_attempts):
                 log(f"{i+1}. kez butona basılıyor...")
                 
-                # Tıklamayı garantiye al
                 submit_button.click(force=True)
-                
-                # ÖNEMLİ: Formun sunucuya gidip yanıt dönmesi (AJAX) için tam 4 saniye bekle.
-                # Önceki kodlarda bu süre çok kısa olduğu için form kilitli kalıyordu.
-                page.wait_for_timeout(4000) 
+                page.wait_for_timeout(4000) # AJAX'ın gitmesi ve yanıtın ekrana basılması için 4 saniye
 
                 actual_message = get_actual_response_message(page)
                 log(f"Sitede Yazan Mesaj: {actual_message}")
                 
                 result["details"].append(f"<b>Deneme {i+1}:</b> {actual_message}")
 
-                # İkinci görseldeki BAŞARI MESAJI kontrolü
+                # Başarı kontrolü
                 if "Thank you" in actual_message or "successfully" in actual_message or "has been sent" in actual_message:
                     final_message = "SUCCESS: " + actual_message
                     log("✅ Form başarıyla gönderildi!")
                     break
                 
-                # Eğer spam hatasıysa (Birinci görsel), formun sıfırlanması için 1 saniye daha bekle ve tekrarla
+                # Hata durumu
                 elif "spam" in actual_message or "cookie" in actual_message:
-                    log("Spam/Cookie hatası alındı (Beklenen durum). Formun resetlenmesi bekleniyor...")
+                    log("Spam/Cookie hatası alındı. Formun resetlenmesi bekleniyor...")
                     page.wait_for_timeout(1500)
                     final_message = "ERROR: " + actual_message
                 else:
@@ -185,7 +202,6 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
 
             # SONUÇ
             result["status"] = final_message
-            
             return result
 
         except Exception as e:
@@ -195,10 +211,11 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             return result
 
         finally:
+            context.close()
             browser.close()
 
 def main():
-    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (AJAX Beklemeli Tam Çözüm)")
+    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (Sayfa Yenilemeli Kesin Çözüm)")
 
     result = run_test(
         name_value="Test User",
