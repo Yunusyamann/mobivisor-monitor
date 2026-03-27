@@ -1,11 +1,11 @@
 import os
+import time
 from datetime import datetime
+from playwright.sync_api import sync_playwright
 import requests
-from bs4 import BeautifulSoup
 
 URL = "https://www.mobivisor.de/en/"
 
-# Ortam değişkenleri (GitHub Secrets'tan gelecek)
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 MAIL_FROM = os.getenv("MAIL_FROM")
 MAIL_TO = os.getenv("MAIL_TO")
@@ -37,17 +37,60 @@ def send_email(subject: str, html: str):
     if response.status_code >= 300:
         log(f"MAIL RESPONSE: {response.text}")
 
+def accept_cookies_if_present(page):
+    log("Cookie popup kontrol ediliyor...")
+    buttons = page.locator("button")
+    for i in range(buttons.count()):
+        try:
+            btn = buttons.nth(i)
+            text = btn.inner_text().strip()
+            
+            if "Accept" in text or "accept" in text:
+                if btn.is_visible():
+                    btn.click()
+                    log("Cookie 'Accept' butonuna basıldı. Sitenin algılaması bekleniyor...")
+                    # Çerezin tarayıcıya işlenmesi için yeterli bekleme süresi
+                    page.wait_for_timeout(2500) 
+                    return True
+        except Exception:
+            pass
+
+    log("Cookie popup bulunamadı.")
+    return False
+
+def html5_email_valid(page):
+    email_input = page.locator('input[type="email"]').first
+    return email_input.evaluate("(el) => el.checkValidity()")
+
+def get_actual_response_message(page) -> str:
+    try:
+        # CF7'nin asıl mesaj kutusu
+        response_locator = page.locator('.wpcf7-response-output')
+        if response_locator.count() > 0 and response_locator.first.is_visible():
+            return response_locator.first.inner_text().strip()
+            
+    except Exception as e:
+        log(f"Mesaj okunurken hata: {e}")
+
+    return "Ekranda herhangi bir geri dönüş mesajı tespit edilemedi."
+
 def build_email_html(result: dict) -> str:
     details_html = "".join(f"<li>{item}</li>" for item in result["details"])
 
     return f"""
     <html>
       <body>
-        <h2>MobiVisor Submit Monitor Sonucu (API Yöntemi)</h2>
+        <h2>MobiVisor Submit Monitor Sonucu</h2>
         <p><b>Zaman:</b> {result["timestamp"]}</p>
         <p><b>Son Durum:</b> {result["status"]}</p>
 
-        <h3>Detaylar</h3>
+        <h3>Kontroller</h3>
+        <ul>
+          <li><b>Cookie accepted:</b> {result["cookie_accepted"]}</li>
+          <li><b>Email valid:</b> {result["email_valid"]}</li>
+        </ul>
+
+        <h3>Detaylar (Her Deneme Sonucu)</h3>
         <ul>
           {details_html}
         </ul>
@@ -59,127 +102,114 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
     result = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "status": "unknown",
+        "cookie_accepted": False,
+        "email_valid": False,
         "details": [],
     }
 
-    # Tarayıcı gibi davranmak için Session ve Header ayarları
-    session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Connection": "keep-alive",
-    }
+    with sync_playwright() as p:
+        # xvfb kullandığımız için headless=False
+        browser = p.chromium.launch(headless=False)
+        page = browser.new_page()
 
-    try:
-        log("1. AŞAMA: Sitenin altyapısına bağlanılıyor...")
-        response = session.get(URL, headers=headers, timeout=30)
-        response.raise_for_status()
-        
-        # Siteyi tarayıp Contact Form 7'yi buluyoruz
-        soup = BeautifulSoup(response.text, 'html.parser')
-        form = soup.find('form', class_=lambda c: c and 'wpcf7-form' in c)
-        
-        if not form:
-            result["status"] = "form_missing"
-            result["details"].append("Sitede form altyapısı (wpcf7) bulunamadı.")
-            log("❌ Form bulunamadı.")
-            return result
-
-        log("2. AŞAMA: Form gizli güvenlik tokenları (nonce) çekiliyor...")
-        payload = {}
-        
-        # Formun içindeki tüm gizli alanları (ID, versiyon, güvenlik tokenları) al
-        for hidden in form.find_all('input', type='hidden'):
-            name = hidden.get('name')
-            value = hidden.get('value', '')
-            if name:
-                payload[name] = value
-
-        form_id = payload.get('_wpcf7')
-        if not form_id:
-            result["status"] = "id_missing"
-            result["details"].append("Form ID'si çıkarılamadı.")
-            return result
-
-        log(f"Form ID bulundu: {form_id}")
-
-        # Dinamik olarak sitedeki form alanlarının 'name' değerlerini bulup doldur
-        text_inputs = form.find_all('input', type='text')
-        if text_inputs:
-            payload[text_inputs[0].get('name')] = name_value
-
-        email_inputs = form.find_all('input', type='email')
-        if email_inputs:
-            payload[email_inputs[0].get('name')] = email_value
-
-        textareas = form.find_all('textarea')
-        if textareas:
-            payload[textareas[0].get('name')] = message_value
-
-        # Arka plan (AJAX) isteği atacağımızı WordPress'e bildiriyoruz
-        payload['_wpcf7_is_ajax_call'] = '1'
-
-        log("3. AŞAMA: Form API üzerinden arka planda gönderiliyor...")
-        
-        # WordPress Contact Form 7 REST API Endpoint'i
-        api_url = f"https://www.mobivisor.de/wp-json/contact-form-7/v1/contact-forms/{form_id}/feedback"
-        
-        # Fetch isteği atıyormuşuz gibi ek başlıklar
-        api_headers = headers.copy()
-        api_headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
-        api_headers["X-Requested-With"] = "XMLHttpRequest"
-
-        post_response = session.post(api_url, data=payload, headers=api_headers, timeout=30)
-        
-        # JSON yanıtını çözümle
         try:
-            json_resp = post_response.json()
-            api_status = json_resp.get("status", "unknown")
-            api_message = json_resp.get("message", "Mesaj okunamadı")
+            log("Site açılıyor...")
+            page.goto(URL, timeout=60000)
+            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_timeout(2000)
+
+            page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(1000)
+
+            # COOKIE ONAYI
+            result["cookie_accepted"] = accept_cookies_if_present(page)
+
+            page.mouse.wheel(0, 1500)
+            page.wait_for_timeout(1000)
+
+            # FORM ELEMANLARI
+            name_input = page.locator('input[type="text"]').first
+            email_input = page.locator('input[type="email"]').first
+            message_input = page.locator('textarea').first
+            submit_button = page.get_by_role("button", name="Send").first
+
+            if not submit_button.is_visible():
+                result["status"] = "form_missing"
+                result["details"].append("Eksik form elemanı.")
+                return result
+
+            log("Form dolduruluyor...")
+            name_input.fill(name_value)
+            email_input.fill(email_value)
+            message_input.fill(message_value)
+
+            result["email_valid"] = html5_email_valid(page)
+            if not result["email_valid"]:
+                result["status"] = "invalid_email"
+                result["details"].append("❌ Email geçersiz.")
+                return result
+
+            log("Form gönderme döngüsü başlıyor...")
+
+            final_message = "Hiçbir mesaj alınamadı."
+            max_attempts = 5 # 5 deneme fazlasıyla yeterli olacaktır
+
+            for i in range(max_attempts):
+                log(f"{i+1}. kez butona basılıyor...")
+                
+                # Tıklamayı garantiye al
+                submit_button.click(force=True)
+                
+                # ÖNEMLİ: Formun sunucuya gidip yanıt dönmesi (AJAX) için tam 4 saniye bekle.
+                # Önceki kodlarda bu süre çok kısa olduğu için form kilitli kalıyordu.
+                page.wait_for_timeout(4000) 
+
+                actual_message = get_actual_response_message(page)
+                log(f"Sitede Yazan Mesaj: {actual_message}")
+                
+                result["details"].append(f"<b>Deneme {i+1}:</b> {actual_message}")
+
+                # İkinci görseldeki BAŞARI MESAJI kontrolü
+                if "Thank you" in actual_message or "successfully" in actual_message or "has been sent" in actual_message:
+                    final_message = "SUCCESS: " + actual_message
+                    log("✅ Form başarıyla gönderildi!")
+                    break
+                
+                # Eğer spam hatasıysa (Birinci görsel), formun sıfırlanması için 1 saniye daha bekle ve tekrarla
+                elif "spam" in actual_message or "cookie" in actual_message:
+                    log("Spam/Cookie hatası alındı (Beklenen durum). Formun resetlenmesi bekleniyor...")
+                    page.wait_for_timeout(1500)
+                    final_message = "ERROR: " + actual_message
+                else:
+                    final_message = "UNKNOWN: " + actual_message
+
+            # SONUÇ
+            result["status"] = final_message
             
-            result["details"].append(f"<b>API Yanıt Durumu:</b> {api_status}")
-            result["details"].append(f"<b>API Mesajı:</b> {api_message}")
-            log(f"Sunucu Yanıtı: [{api_status}] {api_message}")
+            return result
 
-            if api_status == "mail_sent":
-                result["status"] = "SUCCESS"
-                result["details"].append("✅ API üzerinden form başarıyla iletildi.")
-            elif api_status == "spam":
-                result["status"] = "SPAM_BLOCKED"
-                result["details"].append("❌ API isteği spam filtresine takıldı.")
-            elif api_status == "validation_failed":
-                result["status"] = "VALIDATION_ERROR"
-                result["details"].append("❌ Form alanları doğrulamadan geçemedi.")
-            else:
-                result["status"] = f"UNKNOWN: {api_status}"
+        except Exception as e:
+            result["status"] = "exception"
+            result["details"].append(f"❌ HATA: {e}")
+            log(f"❌ HATA: {e}")
+            return result
 
-        except ValueError:
-            result["status"] = "json_error"
-            result["details"].append(f"Sunucu JSON döndürmedi. HTTP Kodu: {post_response.status_code}")
-            log("❌ Sunucu JSON yanıtı vermedi.")
-
-        return result
-
-    except Exception as e:
-        result["status"] = "exception"
-        result["details"].append(f"❌ HATA: {str(e)}")
-        log(f"❌ HATA: {e}")
-        return result
+        finally:
+            browser.close()
 
 def main():
-    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (API & BACKEND YÖNTEMİ)")
+    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (AJAX Beklemeli Tam Çözüm)")
 
     result = run_test(
         name_value="Test User",
         email_value="test@example.com",
-        message_value=f"Automated API check - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        message_value=f"Automated check - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
-    log(f"NİHAİ SONUÇ: {result['status']}")
+    log(f"DEBUG RESULT: {result['status']}")
 
     short_status = (result['status'][:40] + '...') if len(result['status']) > 40 else result['status']
-    subject = f"MobiVisor API Submit: {short_status}"
+    subject = f"MobiVisor Submit: {short_status}"
     
     html = build_email_html(result)
     send_email(subject, html)
