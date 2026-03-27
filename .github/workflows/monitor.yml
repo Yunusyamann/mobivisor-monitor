@@ -24,9 +24,11 @@ jobs:
           playwright install
           playwright install-deps
 
-      - name: Script çalıştır
+      - name: Script çalıştır (Sanal Ekran ile)
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-        run: python monitor.py
+        run: |
+          sudo apt-get install -y xvfb
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python monitor.py
