@@ -46,23 +46,39 @@ def text_exists(page, text: str, timeout=4000) -> bool:
 def accept_cookies_if_present(page) -> bool:
     log("Cookie popup kontrol ediliyor...")
 
-    buttons = page.locator("button")
-    count = buttons.count()
-
-    for i in range(count):
+    # Öncelikle "Tümünü Kabul Et" tarzı, form eklentilerini tamamen açan butonları arayalım
+    primary_texts = ["Accept All", "Accept all", "Allow all", "Allow All Cookies", "Alle akzeptieren", "Tümünü Kabul Et"]
+    
+    for text in primary_texts:
         try:
-            btn = buttons.nth(i)
-            text = btn.inner_text().strip()
-
-            if ("Accept" in text or "accept" in text) and btn.is_visible():
+            btn = page.get_by_role("button", name=text, exact=False).first
+            if btn.is_visible(timeout=1500):
                 btn.click()
-                page.wait_for_timeout(1500)
-                log("Cookie kabul edildi.")
+                page.wait_for_timeout(3000)
+                log(f"Cookie '{text}' butonu ile tam olarak kabul edildi.")
                 return True
         except Exception:
             pass
 
-    log("Cookie popup bulunamadı.")
+    # Bulunamazsa daha genel "accept" veya "akzeptieren" içeren ilk görünür butonu arayalım
+    buttons = page.locator("button")
+    try:
+        count = buttons.count()
+        for i in range(count):
+            try:
+                btn = buttons.nth(i)
+                btn_text = btn.inner_text().strip().lower()
+                if ("accept" in btn_text or "allow" in btn_text or "akzeptieren" in btn_text) and btn.is_visible():
+                    btn.click()
+                    page.wait_for_timeout(3000)
+                    log(f"Cookie genel aramasıyla ({btn_text}) kabul edildi.")
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    log("Cookie popup bulunamadı veya işlem yapılamadı.")
     return False
 
 
@@ -138,18 +154,21 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             page.wait_for_load_state("domcontentloaded")
             page.wait_for_timeout(2000)
 
-            page.mouse.wheel(0, 2500)
-
             # COOKIE
             result["cookie_accepted"] = accept_cookies_if_present(page)
-            if not result["cookie_accepted"]:
-                result["status"] = "cookie_popup_not_handled"
-                result["details"].append("Cookie popup kabul edilemedi veya bulunamadı.")
-                return result
+            
+            # Eğer cookie onaylandıysa, WordPress eklentilerinin (Contact Form vs) engeli 
+            # düzgünce kaldırması için sayfayı bir kez yeniliyoruz.
+            if result["cookie_accepted"]:
+                log("Cookie kabul edildi. Form engelinin kalkması için sayfa yenileniyor...")
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
 
-            page.mouse.wheel(0, 1500)
+            # Yenilemeden sonra formu bulabilmek için sayfayı aşağı kaydır
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(1000)
 
-            # FORM
+            # FORM ELEMANLARINI BUL
             name_input = page.locator('input[type="text"]').first
             email_input = page.locator('input[type="email"]').first
             message_input = page.locator('textarea').first
@@ -209,7 +228,7 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
                     else:
                         log("Maksimum deneme sayısına ulaşıldı.")
                 
-                # Başarılıysa, farklı bir hataysa veya artık son denemeyse döngüyü kır
+                # Başarılıysa veya artık son denemeyse döngüyü kır
                 break
 
             result["status"] = submit_result
@@ -222,7 +241,7 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             elif submit_result == "general_error":
                 result["details"].append("Form gönderilemedi: genel hata alındı.")
             elif submit_result == "cookie_error":
-                result["details"].append("Form gönderilemedi: cookie onayı yetersiz.")
+                result["details"].append("Form gönderilemedi: cookie onayı yetersiz (Yeniden yüklemeye rağmen).")
             elif submit_result == "unknown":
                 result["details"].append("Submit yapıldı ancak sonuç net belirlenemedi.")
 
