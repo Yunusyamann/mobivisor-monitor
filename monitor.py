@@ -39,13 +39,29 @@ def accept_cookies_if_present(page):
     try:
         # Complianz eklentisinin 'Tümünü Kabul Et' butonu
         btn = page.locator('.cmplz-accept').first
-        if btn.is_visible(timeout=3000):
+        if btn.is_visible(timeout=5000):
             btn.click(force=True)
-            log("Cookie 'Tümünü Kabul Et' butonuna basıldı.")
-            page.wait_for_timeout(2000) # JS'in çerezi işlemesi için bekle
+            log("✅ Cookie 'Tümünü Kabul Et' butonuna basıldı.")
+            page.wait_for_timeout(3000) # JS'in çerezi işlemesi için bekle
             return True
     except Exception:
         pass
+        
+    # Alternatif genel arama
+    try:
+        buttons = page.locator("button, a.cc-allow, .cookie-btn")
+        for i in range(buttons.count()):
+            btn = buttons.nth(i)
+            text = btn.inner_text().strip().lower()
+            if ("accept" in text or "allow" in text) and "necessary" not in text:
+                if btn.is_visible():
+                    btn.click(force=True)
+                    log(f"✅ Genel Cookie Butonu ('{text}') basıldı.")
+                    page.wait_for_timeout(3000)
+                    return True
+    except Exception:
+        pass
+
     log("Cookie popup bulunamadı veya zaten kabul edilmiş.")
     return False
 
@@ -63,7 +79,7 @@ def build_email_html(result: dict) -> str:
     return f"""
     <html>
       <body>
-        <h2>MobiVisor Submit Monitor Sonucu (HardyPress JS Simülasyonu)</h2>
+        <h2>MobiVisor Submit Monitor Sonucu (Stealth Mode)</h2>
         <p><b>Zaman:</b> {result["timestamp"]}</p>
         <p><b>Son Durum:</b> {result["status"]}</p>
         <h3>Kontroller</h3>
@@ -87,25 +103,41 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
     }
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False) # Xvfb sanal ekranı ile çalışacak
+        browser = p.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled", # Chrome'un otomasyon izlerini siler
+                "--start-maximized"
+            ]
+        )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080}
         )
+        
+        # BOT OLDUĞUMUZU GİZLEYEN EN KRİTİK KOD (Webdriver değerini siler)
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
         page = context.new_page()
 
         try:
-            log("Site açılıyor...")
+            log("1. Site ilk kez açılıyor...")
             page.goto(URL, timeout=60000)
             page.wait_for_load_state("networkidle")
             
+            # ÇEREZLERİ KABUL ET
             result["cookie_accepted"] = accept_cookies_if_present(page)
 
+            # ÇEREZ KABULÜNDEN SONRA SAYFAYI YENİLE (Spam tokenlarının sıfırlanması için zorunlu)
+            if result["cookie_accepted"]:
+                log("2. Çerezler onaylandı. Güvenlik tokenlarının insan olarak algılanması için sayfa YENİLENİYOR...")
+                page.reload(wait_until="networkidle")
+                page.wait_for_timeout(3000)
+
             # Ekranda formun olduğu yere kaydır
-            page.mouse.wheel(0, 1000)
+            page.mouse.wheel(0, 1500)
             page.wait_for_timeout(1000)
 
-            # EKRAN GÖRÜNTÜSÜNDEN ALINAN KESİN ALAN ADLARI
             name_input = page.locator('input[name="your-name"]').first
             email_input = page.locator('input[name="your-email"]').first
             message_input = page.locator('textarea[name="your-message"]').first
@@ -116,21 +148,21 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
                 result["details"].append("Eksik form elemanı.")
                 return result
 
-            log("Form dolduruluyor...")
-            name_input.fill(name_value)
-            email_input.fill(email_value)
-            message_input.fill(message_value)
+            log("3. Form insan gibi (gecikmeli) dolduruluyor...")
+            # type() metodu ile harfleri insan gibi tek tek yazar (delay=50ms)
+            name_input.type(name_value, delay=50)
+            email_input.type(email_value, delay=50)
+            message_input.type(message_value, delay=50)
 
-            log("Form gönderme döngüsü başlıyor (JavaScript'i uyandırma stratejisi)...")
+            log("4. Form gönderme döngüsü başlıyor...")
             final_message = "Hiçbir mesaj alınamadı."
-            max_attempts = 5 
+            max_attempts = 3 # Sayfa yenilendiği için 3 deneme yeterli
 
             for i in range(max_attempts):
                 log(f"{i+1}. kez butona basılıyor...")
                 
-                # Tıkla ve JavaScript'in yanıt dönmesini bekle
                 submit_button.click(force=True)
-                page.wait_for_timeout(3500) 
+                page.wait_for_timeout(4000) # Sunucu yanıtı için bekle
 
                 actual_message = get_actual_response_message(page)
                 log(f"Sitede Yazan Mesaj: {actual_message}")
@@ -141,9 +173,8 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
                     log("✅ Form başarıyla gönderildi!")
                     break
                 
-                # Eğer spam veya cookie derse, form JS'i kendini sıfırlayana kadar bekle ve LÜTFEN TEKRAR TIKLA
                 elif "spam" in actual_message or "cookie" in actual_message:
-                    log("Spam/Cookie hatası alındı. İkinci tıklama için bekleniyor...")
+                    log("Spam hatası alındı. Tekrar deneniyor...")
                     page.wait_for_timeout(2000)
                     final_message = "ERROR: " + actual_message
                 else:
@@ -164,7 +195,7 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
             browser.close()
 
 def main():
-    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (HardyPress JS Simülasyonu)")
+    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (Stealth Bot Evasion)")
 
     result = run_test(
         name_value="Test User",
