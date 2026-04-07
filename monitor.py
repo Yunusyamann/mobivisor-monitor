@@ -1,10 +1,8 @@
 import os
 from datetime import datetime
-from urllib.parse import urljoin
+from playwright.sync_api import sync_playwright
 import requests
-from bs4 import BeautifulSoup
 
-# Formun bulunduğu sayfanın tam linki (Görsel Türkçe olduğu için /tr/ veya iletişim sayfası linkini yazabilirsin)
 URL = "https://www.mobivisor.de/en/"
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
@@ -33,22 +31,46 @@ def send_email(subject: str, html: str):
         },
         timeout=30,
     )
-
-    log(f"MAIL STATUS CODE: {response.status_code}")
     if response.status_code >= 300:
         log(f"MAIL RESPONSE: {response.text}")
 
+def accept_cookies_if_present(page):
+    log("Cookie popup kontrol ediliyor...")
+    try:
+        # Complianz eklentisinin 'Tümünü Kabul Et' butonu
+        btn = page.locator('.cmplz-accept').first
+        if btn.is_visible(timeout=3000):
+            btn.click(force=True)
+            log("Cookie 'Tümünü Kabul Et' butonuna basıldı.")
+            page.wait_for_timeout(2000) # JS'in çerezi işlemesi için bekle
+            return True
+    except Exception:
+        pass
+    log("Cookie popup bulunamadı veya zaten kabul edilmiş.")
+    return False
+
+def get_actual_response_message(page) -> str:
+    try:
+        response_locator = page.locator('.wpcf7-response-output')
+        if response_locator.count() > 0 and response_locator.first.is_visible():
+            return response_locator.first.inner_text().strip()
+    except Exception:
+        pass
+    return "Ekranda herhangi bir geri dönüş mesajı tespit edilemedi."
+
 def build_email_html(result: dict) -> str:
     details_html = "".join(f"<li>{item}</li>" for item in result["details"])
-
     return f"""
     <html>
       <body>
-        <h2>MobiVisor Submit Monitor Sonucu (Gelişmiş API)</h2>
+        <h2>MobiVisor Submit Monitor Sonucu (HardyPress JS Simülasyonu)</h2>
         <p><b>Zaman:</b> {result["timestamp"]}</p>
         <p><b>Son Durum:</b> {result["status"]}</p>
-
-        <h3>Detaylar</h3>
+        <h3>Kontroller</h3>
+        <ul>
+          <li><b>Cookie accepted:</b> {result["cookie_accepted"]}</li>
+        </ul>
+        <h3>Detaylar (Her Deneme Sonucu)</h3>
         <ul>
           {details_html}
         </ul>
@@ -60,132 +82,100 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
     result = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "status": "unknown",
+        "cookie_accepted": False,
         "details": [],
     }
 
-    session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": URL,
-        "Connection": "keep-alive",
-    }
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False) # Xvfb sanal ekranı ile çalışacak
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080}
+        )
+        page = context.new_page()
 
-    try:
-        log("1. AŞAMA: Form sayfasına bağlanılıyor...")
-        response = session.get(URL, headers=headers, timeout=30)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        form = soup.find('form', class_=lambda c: c and 'wpcf7-form' in c)
-        
-        if not form:
-            result["status"] = "form_missing"
-            result["details"].append("Sitede form altyapısı bulunamadı.")
-            log("❌ Form bulunamadı.")
+        try:
+            log("Site açılıyor...")
+            page.goto(URL, timeout=60000)
+            page.wait_for_load_state("networkidle")
+            
+            result["cookie_accepted"] = accept_cookies_if_present(page)
+
+            # Ekranda formun olduğu yere kaydır
+            page.mouse.wheel(0, 1000)
+            page.wait_for_timeout(1000)
+
+            # EKRAN GÖRÜNTÜSÜNDEN ALINAN KESİN ALAN ADLARI
+            name_input = page.locator('input[name="your-name"]').first
+            email_input = page.locator('input[name="your-email"]').first
+            message_input = page.locator('textarea[name="your-message"]').first
+            submit_button = page.locator('input[type="submit"], button.wpcf7-submit').first
+
+            if not submit_button.is_visible():
+                result["status"] = "form_missing"
+                result["details"].append("Eksik form elemanı.")
+                return result
+
+            log("Form dolduruluyor...")
+            name_input.fill(name_value)
+            email_input.fill(email_value)
+            message_input.fill(message_value)
+
+            log("Form gönderme döngüsü başlıyor (JavaScript'i uyandırma stratejisi)...")
+            final_message = "Hiçbir mesaj alınamadı."
+            max_attempts = 5 
+
+            for i in range(max_attempts):
+                log(f"{i+1}. kez butona basılıyor...")
+                
+                # Tıkla ve JavaScript'in yanıt dönmesini bekle
+                submit_button.click(force=True)
+                page.wait_for_timeout(3500) 
+
+                actual_message = get_actual_response_message(page)
+                log(f"Sitede Yazan Mesaj: {actual_message}")
+                result["details"].append(f"<b>Deneme {i+1}:</b> {actual_message}")
+
+                if "Thank you" in actual_message or "successfully" in actual_message or "has been sent" in actual_message:
+                    final_message = "SUCCESS: " + actual_message
+                    log("✅ Form başarıyla gönderildi!")
+                    break
+                
+                # Eğer spam veya cookie derse, form JS'i kendini sıfırlayana kadar bekle ve LÜTFEN TEKRAR TIKLA
+                elif "spam" in actual_message or "cookie" in actual_message:
+                    log("Spam/Cookie hatası alındı. İkinci tıklama için bekleniyor...")
+                    page.wait_for_timeout(2000)
+                    final_message = "ERROR: " + actual_message
+                else:
+                    final_message = "UNKNOWN: " + actual_message
+                    page.wait_for_timeout(2000)
+
+            result["status"] = final_message
             return result
 
-        log("2. AŞAMA: Form eylem adresi ve tokenlar çekiliyor...")
-        payload = {}
-        
-        # Sitenin kendi form gönderim URL'sini dinamik olarak alıyoruz (REST API'yi zorlamak yerine)
-        action_url = form.get("action")
-        if action_url:
-            submit_url = urljoin(URL, action_url)
-        else:
-            submit_url = URL
-            
-        log(f"Hedef Gönderim URL'si: {submit_url}")
+        except Exception as e:
+            result["status"] = "exception"
+            result["details"].append(f"❌ HATA: {e}")
+            log(f"❌ HATA: {e}")
+            return result
 
-        # Tüm gizli güvenlik tokenlarını al (_wpcf7, _wpnonce vs.)
-        for hidden in form.find_all('input', type='hidden'):
-            name = hidden.get('name')
-            value = hidden.get('value', '')
-            if name:
-                payload[name] = value
-
-        # GÖRSELDEKİ ALANLARI DOLDURMA KISMI
-        # İsim alanı (Genelde text tipindedir)
-        name_input = form.find('input', type='text')
-        if name_input and name_input.get('name'):
-            payload[name_input.get('name')] = name_value
-
-        # E-posta alanı
-        email_input = form.find('input', type='email')
-        if email_input and email_input.get('name'):
-            payload[email_input.get('name')] = email_value
-
-        # Mesaj alanı
-        textarea = form.find('textarea')
-        if textarea and textarea.get('name'):
-            payload[textarea.get('name')] = message_value
-
-        # Formun arka planda asenkron işlenmesi için CF7 bayrağı
-        payload['_wpcf7_is_ajax_call'] = '1'
-
-        log("3. AŞAMA: Form verileri gönderiliyor...")
-        
-        api_headers = headers.copy()
-        api_headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
-        api_headers["X-Requested-With"] = "XMLHttpRequest"
-
-        post_response = session.post(submit_url, data=payload, headers=api_headers, timeout=30)
-        
-        try:
-            json_resp = post_response.json()
-            api_status = json_resp.get("status", "unknown")
-            api_message = json_resp.get("message", "Mesaj okunamadı")
-            
-            result["details"].append(f"<b>Sunucu Yanıt Durumu:</b> {api_status}")
-            result["details"].append(f"<b>Sunucu Mesajı:</b> {api_message}")
-            log(f"Sunucu Yanıtı: [{api_status}] {api_message}")
-
-            if api_status == "mail_sent":
-                result["status"] = "SUCCESS"
-                result["details"].append("✅ Form başarıyla iletildi.")
-            elif api_status == "spam":
-                result["status"] = "SPAM_BLOCKED"
-                result["details"].append("❌ İstek spam filtresine takıldı.")
-            elif api_status == "validation_failed":
-                result["status"] = "VALIDATION_ERROR"
-                result["details"].append("❌ Form alanları eksik veya hatalı.")
-            else:
-                result["status"] = f"UNKNOWN: {api_status}"
-
-        except ValueError:
-            # EĞER JSON DÖNMEZSE, GELEN HTML/HATA SAYFASINI GÖSTER
-            raw_text = post_response.text.strip()
-            preview = raw_text[:300] + "..." if len(raw_text) > 300 else raw_text
-            
-            result["status"] = f"HTTP_{post_response.status_code}_ERROR"
-            result["details"].append(f"❌ Sunucu JSON yerine düz metin/HTML döndürdü (Kod: {post_response.status_code}).")
-            result["details"].append(f"<pre>{preview}</pre>")
-            
-            log(f"❌ JSON hatası. HTTP Kodu: {post_response.status_code}")
-            log(f"Gelen Yanıt (Özet): {preview}")
-
-        return result
-
-    except Exception as e:
-        result["status"] = "exception"
-        result["details"].append(f"❌ HATA: {str(e)}")
-        log(f"❌ HATA: {e}")
-        return result
+        finally:
+            context.close()
+            browser.close()
 
 def main():
-    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (Dinamik Hedefli API)")
+    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (HardyPress JS Simülasyonu)")
 
     result = run_test(
         name_value="Test User",
         email_value="test@example.com",
-        message_value=f"Automated API check - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        message_value=f"Automated check - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
-    log(f"NİHAİ SONUÇ: {result['status']}")
+    log(f"DEBUG RESULT: {result['status']}")
 
     short_status = (result['status'][:40] + '...') if len(result['status']) > 40 else result['status']
-    subject = f"MobiVisor API Submit: {short_status}"
+    subject = f"MobiVisor Submit: {short_status}"
     
     html = build_email_html(result)
     send_email(subject, html)
