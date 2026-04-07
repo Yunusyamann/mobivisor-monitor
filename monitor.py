@@ -1,11 +1,12 @@
 import os
 from datetime import datetime
+from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
+# Formun bulunduğu sayfanın tam linki (Görsel Türkçe olduğu için /tr/ veya iletişim sayfası linkini yazabilirsin)
 URL = "https://www.mobivisor.de/en/"
 
-# Ortam değişkenleri (GitHub Secrets'tan gelecek)
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 MAIL_FROM = os.getenv("MAIL_FROM")
 MAIL_TO = os.getenv("MAIL_TO")
@@ -43,7 +44,7 @@ def build_email_html(result: dict) -> str:
     return f"""
     <html>
       <body>
-        <h2>MobiVisor Submit Monitor Sonucu (API Yöntemi)</h2>
+        <h2>MobiVisor Submit Monitor Sonucu (Gelişmiş API)</h2>
         <p><b>Zaman:</b> {result["timestamp"]}</p>
         <p><b>Son Durum:</b> {result["status"]}</p>
 
@@ -62,102 +63,107 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
         "details": [],
     }
 
-    # Tarayıcı gibi davranmak için Session ve Header ayarları
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": URL,
         "Connection": "keep-alive",
     }
 
     try:
-        log("1. AŞAMA: Sitenin altyapısına bağlanılıyor...")
+        log("1. AŞAMA: Form sayfasına bağlanılıyor...")
         response = session.get(URL, headers=headers, timeout=30)
         response.raise_for_status()
         
-        # Siteyi tarayıp Contact Form 7'yi buluyoruz
         soup = BeautifulSoup(response.text, 'html.parser')
         form = soup.find('form', class_=lambda c: c and 'wpcf7-form' in c)
         
         if not form:
             result["status"] = "form_missing"
-            result["details"].append("Sitede form altyapısı (wpcf7) bulunamadı.")
+            result["details"].append("Sitede form altyapısı bulunamadı.")
             log("❌ Form bulunamadı.")
             return result
 
-        log("2. AŞAMA: Form gizli güvenlik tokenları (nonce) çekiliyor...")
+        log("2. AŞAMA: Form eylem adresi ve tokenlar çekiliyor...")
         payload = {}
         
-        # Formun içindeki tüm gizli alanları (ID, versiyon, güvenlik tokenları) al
+        # Sitenin kendi form gönderim URL'sini dinamik olarak alıyoruz (REST API'yi zorlamak yerine)
+        action_url = form.get("action")
+        if action_url:
+            submit_url = urljoin(URL, action_url)
+        else:
+            submit_url = URL
+            
+        log(f"Hedef Gönderim URL'si: {submit_url}")
+
+        # Tüm gizli güvenlik tokenlarını al (_wpcf7, _wpnonce vs.)
         for hidden in form.find_all('input', type='hidden'):
             name = hidden.get('name')
             value = hidden.get('value', '')
             if name:
                 payload[name] = value
 
-        form_id = payload.get('_wpcf7')
-        if not form_id:
-            result["status"] = "id_missing"
-            result["details"].append("Form ID'si çıkarılamadı.")
-            return result
+        # GÖRSELDEKİ ALANLARI DOLDURMA KISMI
+        # İsim alanı (Genelde text tipindedir)
+        name_input = form.find('input', type='text')
+        if name_input and name_input.get('name'):
+            payload[name_input.get('name')] = name_value
 
-        log(f"Form ID bulundu: {form_id}")
+        # E-posta alanı
+        email_input = form.find('input', type='email')
+        if email_input and email_input.get('name'):
+            payload[email_input.get('name')] = email_value
 
-        # Dinamik olarak sitedeki form alanlarının 'name' değerlerini bulup doldur
-        text_inputs = form.find_all('input', type='text')
-        if text_inputs:
-            payload[text_inputs[0].get('name')] = name_value
+        # Mesaj alanı
+        textarea = form.find('textarea')
+        if textarea and textarea.get('name'):
+            payload[textarea.get('name')] = message_value
 
-        email_inputs = form.find_all('input', type='email')
-        if email_inputs:
-            payload[email_inputs[0].get('name')] = email_value
-
-        textareas = form.find_all('textarea')
-        if textareas:
-            payload[textareas[0].get('name')] = message_value
-
-        # Arka plan (AJAX) isteği atacağımızı WordPress'e bildiriyoruz
+        # Formun arka planda asenkron işlenmesi için CF7 bayrağı
         payload['_wpcf7_is_ajax_call'] = '1'
 
-        log("3. AŞAMA: Form API üzerinden arka planda gönderiliyor...")
+        log("3. AŞAMA: Form verileri gönderiliyor...")
         
-        # WordPress Contact Form 7 REST API Endpoint'i
-        api_url = f"https://www.mobivisor.de/wp-json/contact-form-7/v1/contact-forms/{form_id}/feedback"
-        
-        # Fetch isteği atıyormuşuz gibi ek başlıklar
         api_headers = headers.copy()
         api_headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
         api_headers["X-Requested-With"] = "XMLHttpRequest"
 
-        post_response = session.post(api_url, data=payload, headers=api_headers, timeout=30)
+        post_response = session.post(submit_url, data=payload, headers=api_headers, timeout=30)
         
-        # JSON yanıtını çözümle
         try:
             json_resp = post_response.json()
             api_status = json_resp.get("status", "unknown")
             api_message = json_resp.get("message", "Mesaj okunamadı")
             
-            result["details"].append(f"<b>API Yanıt Durumu:</b> {api_status}")
-            result["details"].append(f"<b>API Mesajı:</b> {api_message}")
+            result["details"].append(f"<b>Sunucu Yanıt Durumu:</b> {api_status}")
+            result["details"].append(f"<b>Sunucu Mesajı:</b> {api_message}")
             log(f"Sunucu Yanıtı: [{api_status}] {api_message}")
 
             if api_status == "mail_sent":
                 result["status"] = "SUCCESS"
-                result["details"].append("✅ API üzerinden form başarıyla iletildi.")
+                result["details"].append("✅ Form başarıyla iletildi.")
             elif api_status == "spam":
                 result["status"] = "SPAM_BLOCKED"
-                result["details"].append("❌ API isteği spam filtresine takıldı.")
+                result["details"].append("❌ İstek spam filtresine takıldı.")
             elif api_status == "validation_failed":
                 result["status"] = "VALIDATION_ERROR"
-                result["details"].append("❌ Form alanları doğrulamadan geçemedi.")
+                result["details"].append("❌ Form alanları eksik veya hatalı.")
             else:
                 result["status"] = f"UNKNOWN: {api_status}"
 
         except ValueError:
-            result["status"] = "json_error"
-            result["details"].append(f"Sunucu JSON döndürmedi. HTTP Kodu: {post_response.status_code}")
-            log("❌ Sunucu JSON yanıtı vermedi.")
+            # EĞER JSON DÖNMEZSE, GELEN HTML/HATA SAYFASINI GÖSTER
+            raw_text = post_response.text.strip()
+            preview = raw_text[:300] + "..." if len(raw_text) > 300 else raw_text
+            
+            result["status"] = f"HTTP_{post_response.status_code}_ERROR"
+            result["details"].append(f"❌ Sunucu JSON yerine düz metin/HTML döndürdü (Kod: {post_response.status_code}).")
+            result["details"].append(f"<pre>{preview}</pre>")
+            
+            log(f"❌ JSON hatası. HTTP Kodu: {post_response.status_code}")
+            log(f"Gelen Yanıt (Özet): {preview}")
 
         return result
 
@@ -168,7 +174,7 @@ def run_test(name_value: str, email_value: str, message_value: str) -> dict:
         return result
 
 def main():
-    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (API & BACKEND YÖNTEMİ)")
+    log("DEBUG: GITHUB MONITOR SURUMU CALISIYOR (Dinamik Hedefli API)")
 
     result = run_test(
         name_value="Test User",
